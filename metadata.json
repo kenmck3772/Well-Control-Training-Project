@@ -1,0 +1,7 @@
+{
+  "name": "Well Control Training Project",
+  "description": "An interactive IWCF training platform featuring a digital Kill Sheet simulator, real-time pressure visualizations, and an AI-powered well control instructor.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
