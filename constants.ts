@@ -14,11 +14,11 @@ export const DEFAULT_KILL_SHEET: KillSheetData = {
   annulusCapacity: 0.0459,
   surfaceTemp: 65,
   bottomHoleTemp: 195,
-  ambientTemp: 60,
-  atmPressure: 14.7,
-  expectedDuration: 24,
-  fluidType: 'WBM',
-  rigPowerSource: 'Diesel',
+  ambientTemperature: 60, // New default value for ambient temperature
+  surfacePressureBaseline: 14.7, // Renamed from atmPressure
+  expectedDuration: 24, // Default to 24 hours
+  fluidType: 'WBM', // Default fluid type
+  rigPowerSource: 'Diesel', // Default rig power source
 };
 
 export const PUMP_OUTPUT = 0.119;

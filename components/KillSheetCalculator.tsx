@@ -109,18 +109,23 @@ const TOOLTIP_DATA: Record<string, string> = {
   esd: "FUNCTION: Automated emergency sequence that secures the wellbore immediately.",
   simSpeed: "Global simulation time multiplier. Controls the rate of pressure transients.",
   safetyLock: "AUTOMATED LOCK: Engaged when surface pressure exceeds MAASP.",
-  co2e: "Carbon Dioxide Equivalent (CO2e). Total estimated greenhouse gas emissions based on rig power source, base fluid choice, and weighting agent consumption (Barite).",
+  co2e: "Carbon Dioxide Equivalent (CO2e). Total estimated greenhouse gas emissions based on rig power source, base fluid choice, and weighting agent consumption (Barite).", // Updated tooltip
   hookLoad: "The net downward force measured by the weight indicator. In stripping, this accounts for buoyant weight, pressure force, and stripping friction.",
-  ambientTemp: "Air temperature at the rig site. Extremes affect equipment efficiency and hydraulic response times.",
-  atmPressure: "Local atmospheric pressure. Essential for calculating absolute gas expansion in wellbore transients.",
+  ambientTemperature: "Air temperature at the rig site. Extremes affect equipment efficiency (e.g., pump, choke responsiveness) and hydraulic response times.", // Updated tooltip
+  surfacePressureBaseline: "Local atmospheric pressure baseline at the surface. Essential for calculating absolute gas expansion using Boyle's and Charles' laws in wellbore transients.", // Updated tooltip
   surfaceTemp: "The temperature at the wellhead. Influences gas density and thermal gradients.",
   bottomHoleTemp: "The temperature at the bottom of the well. Critical for calculating gas expansion during migration.",
+  drillStringVolume: "Calculated volume of the drill string. Formula: Drill String Capacity × Drill String Length.",
+  annulusVolume: "Calculated volume of the annulus. Formula: Annulus Capacity × Measured Depth.",
   annular: "Annular Preventer: A flexible seal that can close around any pipe size or the open hole. Used as the first line of secondary well control.",
   pipeRam: "Pipe Rams: Mechanical blocks designed to close specifically around drill pipe. Provides a high-pressure mechanical seal.",
   blindRam: "Blind Rams: Large mechanical blocks that close the entire wellbore when no pipe is present. Essential for full shut-in.",
   shearRam: "Shear Rams: Emergency mechanical blocks equipped with blades to cut through drill pipe and seal the wellbore completely.",
   chokeValve: "Choke Valve: Controls fluid flow and maintains backpressure during circulation to keep Bottom Hole Pressure constant.",
-  killValve: "Kill Valve: Entry point for pumping heavy mud directly into the annulus to regain hydrostatic control."
+  killValve: "Kill Valve: Entry point for pumping heavy mud directly into the annulus to regain hydrostatic control.",
+  expectedDuration: "Estimated duration of the well control operation in hours. Used for power-related CO2e calculations.",
+  fluidType: "The type of drilling fluid used (Water-Based Mud or Oil-Based Mud). Influences fluid-related CO2e calculations.",
+  rigPowerSource: "The primary power source for the drilling rig (Diesel, Hybrid, or Grid). Directly impacts power-related CO2e emissions."
 };
 
 const Tooltip: React.FC<{ id: string; children: React.ReactNode; position?: 'top' | 'bottom' | 'left' | 'right' }> = ({ id, children, position = 'top' }) => {
@@ -194,6 +199,7 @@ interface SimulationState {
   history: HistoryEvent[];
   pressureHistory: { time: number; pressure: number; target: number }[];
   initialBHP: number;
+  previousResultant: number; // Added to track balance point for stripping
 }
 
 type SimulationAction = 
@@ -246,7 +252,8 @@ const INITIAL_STATE: SimulationState = {
   },
   history: [{ id: 'init', timestamp: Date.now(), type: 'SYSTEM', message: 'WellTegra Core Systems Online.', severity: 'info' }],
   pressureHistory: [],
-  initialBHP: 0
+  initialBHP: 0,
+  previousResultant: 0, // Initialized for stripping balance point
 };
 
 const BopStackGraphic: React.FC<{ valves: SimulationState['valves'] }> = ({ valves }) => {
@@ -482,34 +489,64 @@ const simReducer = (state: SimulationState, action: SimulationAction): Simulatio
       let nextDownwardForce = state.downwardForce;
       let newEvents: HistoryEvent[] = [];
       let nextStatus: SimStatus = state.status;
+      let nextPreviousResultant = state.previousResultant; // For balance point tracking
       
       // GRANULAR EQUIPMENT EFFICIENCY BASED ON AMBIENT TEMP
-      const equipmentEfficiency = data.ambientTemp < 20 ? 0.60 : data.ambientTemp < 40 ? 0.80 : data.ambientTemp > 115 ? 0.75 : 1.0;
+      // Adjusted to use new `ambientTemperature` property
+      const equipmentEfficiency = data.ambientTemperature < 20 ? 0.60 : data.ambientTemperature < 40 ? 0.80 : data.ambientTemperature > 115 ? 0.75 : 1.0;
       
       if (nextSurface > results.maasp) {
         nextStatus = 'PAUSED';
         newEvents.push(log('ALARM', 'MAASP BREACH DETECTED. AUTO-LOCK ENGAGED.', 'danger'));
       }
+
+      // Tool Depth Movement (applies to all modes where winch is active)
       if (state.winchDirection !== 'NONE') {
         const baseVelocity = (state.winchSpeed / 60) * state.speed;
         const velocity = baseVelocity * equipmentEfficiency;
         nextDepth = Math.max(0, Math.min(data.tvd, nextDepth + (state.winchDirection === 'IN' ? velocity : -velocity)));
       }
+
       if (state.mode === SimulationMode.STANDARD_KILL) nextStrokes += 10 * state.speed * equipmentEfficiency;
+
       if (state.mode === SimulationMode.STRIPPING) {
         const buoyancyFactor = 1 - (data.currentMudWeight / 65.5);
         nextDownwardForce = nextDepth * PIPE_WEIGHT_LBF_FT * buoyancyFactor;
         nextUpwardForce = nextSurface * PIPE_AREA_SQIN;
+        
         const frictionEffect = state.winchDirection !== 'NONE' ? STRIPPING_FRICTION_LBF : 0;
-        const resultant = nextDownwardForce - nextUpwardForce;
+        const currentResultant = nextDownwardForce - nextUpwardForce; // Positive: pipe heavy, Negative: pipe light
+
         if (state.winchDirection === 'IN') {
-           nextIndicatedWeight = resultant - frictionEffect;
+           nextIndicatedWeight = currentResultant - frictionEffect;
         } else if (state.winchDirection === 'OUT') {
-           nextIndicatedWeight = resultant + frictionEffect;
+           nextIndicatedWeight = currentResultant + frictionEffect;
         } else {
-           nextIndicatedWeight = resultant;
+           nextIndicatedWeight = currentResultant; // No friction when stationary
         }
+
+        // Balance Point Detection and Logging
+        // Check if the pipe was heavy and is now light, or vice-versa
+        const wasPipeHeavy = state.previousResultant > 0;
+        const isPipeHeavy = currentResultant > 0;
+
+        if (wasPipeHeavy !== isPipeHeavy && Math.abs(currentResultant) < 100) { // Add a small threshold for precision
+            if (isPipeHeavy) {
+                newEvents.push(log('SNUBBING', 'Balance Point Crossed: Pipe now HEAVY (requires holding back or letting fall).', 'info'));
+            } else {
+                newEvents.push(log('SNUBBING', 'Balance Point Crossed: Pipe now LIGHT (requires snubbing in or holding down).', 'warning'));
+            }
+        }
+        nextPreviousResultant = currentResultant; // Update previous resultant for next tick
+      } else {
+        // Reset/default forces and indicated weight for non-stripping modes, or keep initial
+        nextDownwardForce = (state.mode === SimulationMode.SLICKLINE_OPERATION) ? state.toolDepth * SLICKLINE_TOOL_WEIGHT_LBS / data.drillStringLength : (state.mode === SimulationMode.WIRELINE_OPERATION) ? state.toolDepth * WIRELINE_TOOL_WEIGHT_LBS / data.drillStringLength : 0; // Simplified for other tool modes
+        nextUpwardForce = 0;
+        nextIndicatedWeight = nextDownwardForce; // No buoyancy/pressure effect for non-stripping modes (simplified)
+        nextPreviousResultant = 0; // Reset for non-stripping modes
       }
+
+
       if (state.mode === SimulationMode.GAS_MIGRATION && nextGasDepth > 0) {
         const mudGradient = 0.052 * data.currentMudWeight;
         const migrationRate = GAS_MIGRATION_BASE_SPEED * state.speed;
@@ -520,7 +557,8 @@ const simReducer = (state: SimulationState, action: SimulationAction): Simulatio
         
         const hydroAbove = mudGradient * state.gasDepth;
         const hydroAboveNext = mudGradient * (state.gasDepth - migrationRate);
-        const p1_abs = state.surfacePressure + hydroAbove + data.atmPressure;
+        // Using `surfacePressureBaseline` (renamed from `atmPressure`) for absolute pressure calculation
+        const p1_abs = state.surfacePressure + hydroAbove + data.surfacePressureBaseline;
         
         nextGasDepth = Math.max(0, state.gasDepth - migrationRate);
         if (state.valves.choke === 'CLOSED') {
@@ -529,7 +567,8 @@ const simReducer = (state: SimulationState, action: SimulationAction): Simulatio
         } else {
           const bleedFactor = (state.chokePosition / 100) * 150 * state.speed * equipmentEfficiency;
           const targetSurface = Math.max(0, state.surfacePressure - bleedFactor);
-          const p2_abs = targetSurface + hydroAboveNext + data.atmPressure;
+          // Using `surfacePressureBaseline` (renamed from `atmPressure`) for absolute pressure calculation
+          const p2_abs = targetSurface + hydroAboveNext + data.surfacePressureBaseline;
           const t1_abs = prevTemp + 460; // Rankine
           const t2_abs = currentTemp + 460; // Rankine
           
@@ -553,7 +592,8 @@ const simReducer = (state: SimulationState, action: SimulationAction): Simulatio
         upwardForce: nextUpwardForce,
         downwardForce: nextDownwardForce,
         history: [...newEvents, ...state.history].slice(0, 100),
-        pressureHistory: [...state.pressureHistory, { time: Date.now(), pressure: nextSurface, target: state.targetPressure }].slice(-100)
+        pressureHistory: [...state.pressureHistory, { time: Date.now(), pressure: nextSurface, target: state.targetPressure }].slice(-100),
+        previousResultant: nextPreviousResultant, // Update previous resultant in state
       };
     }
     default: return state;
@@ -566,7 +606,7 @@ export const KillSheetCalculator: React.FC<KillSheetCalculatorProps> = ({ initia
   const [unitSystem, setUnitSystem] = useState<UnitSystem>(UnitSystem.IMPERIAL);
   const [isAICoachOpen, setIsAICoachOpen] = useState(false);
   const [isHistoryCollapsed, setIsHistoryCollapsed] = useState(true);
-  const [isSustainabilityCollapsed, setIsSustainabilityCollapsed] = useState(false);
+  const [isSustainabilityCollapsed, setIsSustainabilityCollapsed] = useState(false); // New state for collapsible panel
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // --- Technical Formatting & Unit Management ---
@@ -616,19 +656,31 @@ export const KillSheetCalculator: React.FC<KillSheetCalculatorProps> = ({ initia
     const icp = sidpp + scrPressure;
     const fcp = scrPressure * (killMudWeight / currentMudWeight);
     const maasp = (leakOffTestMW - currentMudWeight) * 0.052 * shoeTVD;
-    const totalVolume = (annulusCapacity * measuredDepth) + (drillStringCapacity * drillStringLength);
+    
+    // New Calculations
+    const drillStringVolume = drillStringCapacity * drillStringLength;
+    const annulusVolume = annulusCapacity * measuredDepth;
+
+    const totalVolume = annulusVolume + drillStringVolume;
     const strokesToBit = Math.round((drillStringCapacity * drillStringLength) / PUMP_OUTPUT);
+
+    // CO2e Calculations
     const powerCO2 = expectedDuration * EMISSIONS.POWER[rigPowerSource];
-    const fluidCO2 = totalVolume * EMISSIONS.FLUID_BASE[fluidType];
-    const weightCO2 = totalVolume * Math.max(0, currentMudWeight - 8.33) * EMISSIONS.WEIGHTING_AGENT;
+    // Convert totalVolume to bbls for fluid CO2 calculation (if metric, convert back)
+    const totalVolumeBBL = unitSystem === UnitSystem.METRIC ? totalVolume / CONV.BBL_TO_M3 : totalVolume;
+    const fluidCO2 = totalVolumeBBL * EMISSIONS.FLUID_BASE[fluidType];
+    // Assuming base mud weight for water is 8.33 ppg (Imperial)
+    const baseMudWeightPPG = 8.33; 
+    const weightingAgentCO2 = totalVolumeBBL * Math.max(0, currentMudWeight - baseMudWeightPPG) * EMISSIONS.WEIGHTING_AGENT;
+
     return { 
       killMudWeight, icp, fcp, 
-      drillStringVolume: drillStringCapacity * drillStringLength, annulusVolume: annulusCapacity * measuredDepth, 
+      drillStringVolume, annulusVolume, 
       strokesToBit, maasp, pressureSchedule: [],
-      co2eTotal: powerCO2 + fluidCO2 + weightCO2,
-      co2eBreakdown: { power: powerCO2, fluid: fluidCO2, weight: weightCO2 }
+      co2eTotal: powerCO2 + fluidCO2 + weightingAgentCO2,
+      co2eBreakdown: { power: powerCO2, fluid: fluidCO2, weight: weightingAgentCO2 }
     };
-  }, [data]);
+  }, [data, unitSystem]); // Added unitSystem to dependency array for correct volume conversion
 
   const co2ChartData = useMemo(() => [
     { name: 'Power', value: results.co2eBreakdown.power, color: '#10b981' },
@@ -732,20 +784,91 @@ export const KillSheetCalculator: React.FC<KillSheetCalculatorProps> = ({ initia
                  <h3 className="font-black text-slate-900 uppercase tracking-tight text-[11px]">Surface Environment</h3>
               </div>
               <div className="space-y-5">
-                 <Tooltip id="ambientTemp">
+                 <Tooltip id="ambientTemperature">
                    <div className="bg-slate-50 rounded-[1.25rem] p-4 border border-slate-100 w-full hover:bg-slate-100/50 transition-colors">
                      <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-2">Ambient Temp ({fmt.tUnit()})</label>
-                     <input type="number" step="0.1" value={fmt.temp(data.ambientTemp)} onChange={(e) => setData({...data, ambientTemp: fmt.toImpTemp(e.target.value)})} className="bg-transparent text-slate-900 font-mono text-sm border-none outline-none w-full" />
+                     <input type="number" step="0.1" value={fmt.temp(data.ambientTemperature)} onChange={(e) => setData({...data, ambientTemperature: fmt.toImpTemp(e.target.value)})} className="bg-transparent text-slate-900 font-mono text-sm border-none outline-none w-full" />
                    </div>
                  </Tooltip>
-                 <Tooltip id="atmPressure">
+                 <Tooltip id="surfacePressureBaseline">
                    <div className="bg-slate-50 rounded-[1.25rem] p-4 border border-slate-100 w-full hover:bg-slate-100/50 transition-colors">
                      <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-2">Surface Pressure Baseline ({fmt.pUnit()})</label>
-                     <input type="number" step="0.1" value={fmt.press(data.atmPressure)} onChange={(e) => setData({...data, atmPressure: fmt.toImpPress(e.target.value)})} className="bg-transparent text-slate-900 font-mono text-sm border-none outline-none w-full" />
+                     <input type="number" step="0.1" value={fmt.press(data.surfacePressureBaseline)} onChange={(e) => setData({...data, surfacePressureBaseline: fmt.toImpPress(e.target.value)})} className="bg-transparent text-slate-900 font-mono text-sm border-none outline-none w-full" />
                    </div>
                  </Tooltip>
               </div>
            </div>
+        </div>
+
+        {/* Sustainability Metrics Panel */}
+        <div className={`rounded-[2.5rem] p-8 border shadow-sm overflow-hidden flex flex-col transition-all duration-700 ${isSustainabilityCollapsed ? 'min-h-[140px]' : 'min-h-[400px]'} ${isSustainabilityCollapsed ? 'bg-slate-50' : 'bg-white'}`}>
+           <button onClick={() => setIsSustainabilityCollapsed(!isSustainabilityCollapsed)} className="w-full flex items-center justify-between pb-6 border-b border-slate-100 group">
+              <div className="flex items-center gap-3">
+                 <div className="p-2 bg-emerald-50 text-emerald-600 rounded-xl"><Leaf size={18} /></div>
+                 <h3 className="font-black text-slate-900 uppercase tracking-tight text-[11px]">Sustainability Metrics</h3>
+              </div>
+              {isSustainabilityCollapsed ? <ChevronDown size={22} className="text-slate-300" /> : <ChevronUp size={22} className="text-slate-300" />}
+           </button>
+           {!isSustainabilityCollapsed && (
+             <div className="pt-6 space-y-6 animate-in fade-in slide-in-from-top-4 duration-500">
+               <div className="grid grid-cols-2 gap-4">
+                 <Tooltip id="rigPowerSource">
+                   <div>
+                     <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-2">Rig Power Source</label>
+                     <select 
+                       value={data.rigPowerSource} 
+                       onChange={(e) => setData({...data, rigPowerSource: e.target.value as any})}
+                       className="bg-slate-50 rounded-xl p-3 border border-slate-100 text-xs font-bold text-slate-900 w-full outline-none appearance-none"
+                     >
+                       <option value="Diesel">Diesel</option>
+                       <option value="Hybrid">Hybrid</option>
+                       <option value="Grid">Grid</option>
+                     </select>
+                   </div>
+                 </Tooltip>
+                 <Tooltip id="fluidType">
+                   <div>
+                     <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-2">Fluid Type</label>
+                     <select 
+                       value={data.fluidType} 
+                       onChange={(e) => setData({...data, fluidType: e.target.value as any})}
+                       className="bg-slate-50 rounded-xl p-3 border border-slate-100 text-xs font-bold text-slate-900 w-full outline-none appearance-none"
+                     >
+                       <option value="WBM">WBM</option>
+                       <option value="OBM">OBM</option>
+                     </select>
+                   </div>
+                 </Tooltip>
+               </div>
+               <Tooltip id="expectedDuration">
+                 <div className="bg-slate-50 rounded-[1.25rem] p-4 border border-slate-100 w-full">
+                   <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-2">Op. Duration (Hrs)</label>
+                   <input type="number" step="1" value={data.expectedDuration} onChange={(e) => setData({...data, expectedDuration: parseInt(e.target.value) || 0})} className="bg-transparent text-slate-900 font-mono text-sm border-none outline-none w-full" />
+                 </div>
+               </Tooltip>
+
+               <Tooltip id="co2e">
+                 <div className="py-4 border-t border-slate-100">
+                   <div className="flex justify-between items-center mb-4">
+                     <span className="text-[9px] font-black text-slate-500 uppercase tracking-[0.2em]">Total CO2e</span>
+                     <span className="text-xl font-black font-mono text-emerald-600">{results.co2eTotal.toFixed(1)} <span className="text-[8px] opacity-40">kg</span></span>
+                   </div>
+                   <ResponsiveContainer width="100%" height={120}>
+                     <BarChart data={co2ChartData}>
+                       <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 9, fill: '#64748b', fontWeight: 'bold', textTransform: 'uppercase' }} />
+                       <YAxis hide />
+                       <CartesianGrid vertical={false} stroke="#e2e8f0" strokeDasharray="3 3" opacity={0.4} />
+                       <Bar dataKey="value" barSize={20}>
+                         {co2ChartData.map((entry, index) => (
+                           <Cell key={`cell-${index}`} fill={entry.color} radius={[10, 10, 0, 0]} />
+                         ))}
+                       </Bar>
+                     </BarChart>
+                   </ResponsiveContainer>
+                 </div>
+               </Tooltip>
+             </div>
+           )}
         </div>
 
         {/* Dynamic Benchmarks Panel */}
@@ -778,7 +901,7 @@ export const KillSheetCalculator: React.FC<KillSheetCalculatorProps> = ({ initia
               <h3 className="font-black text-white uppercase tracking-tight text-[11px]">Well Geometry</h3>
            </div>
            <div className="space-y-5">
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-2 gap-4 mb-4">
                  <div>
                     <label className="text-[8px] font-black text-slate-500 uppercase tracking-widest block mb-2">TVD ({fmt.dUnit()})</label>
                     <input type="number" step="1" value={fmt.depth(data.tvd)} onChange={(e) => setData({...data, tvd: fmt.toImpDepth(e.target.value)})} className="bg-transparent text-white font-mono text-sm border-b border-white/10 outline-none w-full py-1 hover:border-blue-500 transition-colors" />
@@ -787,6 +910,24 @@ export const KillSheetCalculator: React.FC<KillSheetCalculatorProps> = ({ initia
                     <label className="text-[8px] font-black text-slate-500 uppercase tracking-widest block mb-2">Shoe TVD ({fmt.dUnit()})</label>
                     <input type="number" step="1" value={fmt.depth(data.shoeTVD)} onChange={(e) => setData({...data, shoeTVD: fmt.toImpDepth(e.target.value)})} className="bg-transparent text-white font-mono text-sm border-b border-white/10 outline-none w-full py-1 hover:border-blue-500 transition-colors" />
                  </div>
+              </div>
+              <div className="space-y-4 pt-4 border-t border-white/10">
+                <Tooltip id="drillStringVolume" position="right">
+                  <div className="flex justify-between items-center py-2">
+                    <span className="text-[9px] font-black text-slate-500 uppercase tracking-[0.2em]">Drill String Volume</span>
+                    <span className="text-xs font-black font-mono text-blue-400">
+                      {fmt.vol(results.drillStringVolume)} <span className="text-[8px] opacity-40">{fmt.vUnit()}</span>
+                    </span>
+                  </div>
+                </Tooltip>
+                <Tooltip id="annulusVolume" position="right">
+                  <div className="flex justify-between items-center py-2">
+                    <span className="text-[9px] font-black text-slate-500 uppercase tracking-[0.2em]">Annulus Volume</span>
+                    <span className="text-xs font-black font-mono text-blue-400">
+                      {fmt.vol(results.annulusVolume)} <span className="text-[8px] opacity-40">{fmt.vUnit()}</span>
+                    </span>
+                  </div>
+                </Tooltip>
               </div>
            </div>
         </div>
@@ -942,6 +1083,60 @@ export const KillSheetCalculator: React.FC<KillSheetCalculatorProps> = ({ initia
               </div>
            </div>
 
+           {/* RIG FLOOR STATUS SECTION */}
+           <div className="bg-white rounded-[2.5rem] p-8 mb-8 border border-slate-200 shadow-sm space-y-6">
+              <div className="flex items-center gap-3 mb-6">
+                 <div className="p-2 bg-purple-50 text-purple-600 rounded-xl"><Cpu size={18} /></div>
+                 <h3 className="font-black text-slate-900 uppercase tracking-tight text-[11px]">Rig Floor Status</h3>
+              </div>
+              <div className="space-y-4">
+                {/* Drawworks Status */}
+                <div className="flex justify-between items-center bg-slate-50 rounded-[1.25rem] p-4 border border-slate-100">
+                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-[0.2em]">Drawworks</span>
+                  <div className="flex items-center gap-3">
+                    {simState.rigFloor.drawworks === 'ENGAGED' ? (
+                      <ArrowDownToLine size={16} className="text-emerald-500 animate-pulse" />
+                    ) : (
+                      <PowerOff size={16} className="text-slate-500" />
+                    )}
+                    <span className={`text-xs font-black font-mono ${simState.rigFloor.drawworks === 'ENGAGED' ? 'text-emerald-600' : 'text-slate-600'}`}>
+                      {simState.rigFloor.drawworks}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Top Drive Status */}
+                <div className="flex justify-between items-center bg-slate-50 rounded-[1.25rem] p-4 border border-slate-100">
+                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-[0.2em]">Top Drive</span>
+                  <div className="flex items-center gap-3">
+                    {simState.rigFloor.topDrive === 'ACTIVE' ? (
+                      <Rotate3d size={16} className="text-emerald-500 animate-spin-slow" />
+                    ) : (
+                      <Pause size={16} className="text-slate-500" />
+                    )}
+                    <span className={`text-xs font-black font-mono ${simState.rigFloor.topDrive === 'ACTIVE' ? 'text-emerald-600' : 'text-slate-600'}`}>
+                      {simState.rigFloor.topDrive}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Rotary Table Status */}
+                <div className="flex justify-between items-center bg-slate-50 rounded-[1.25rem] p-4 border border-slate-100">
+                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-[0.2em]">Rotary Table</span>
+                  <div className="flex items-center gap-3">
+                    {simState.rigFloor.rotaryTable === 'ROTATING' ? (
+                      <RefreshCw size={16} className="text-emerald-500 animate-spin" />
+                    ) : (
+                      <CircleSlash size={16} className="text-slate-500" />
+                    )}
+                    <span className={`text-xs font-black font-mono ${simState.rigFloor.rotaryTable === 'ROTATING' ? 'text-emerald-600' : 'text-slate-600'}`}>
+                      {simState.rigFloor.rotaryTable}
+                    </span>
+                  </div>
+                </div>
+              </div>
+           </div>
+
            {/* MASTER WELL CONTROL SECTION */}
            <div className="bg-[#020617] rounded-[2.5rem] p-8 mb-8 border border-white/5 shadow-2xl relative overflow-hidden group/shut">
               <div className="absolute top-0 right-0 w-32 h-32 bg-red-600/10 rounded-full blur-3xl group-hover/shut:scale-150 transition-transform duration-1000"></div>
@@ -986,7 +1181,7 @@ export const KillSheetCalculator: React.FC<KillSheetCalculatorProps> = ({ initia
       
       {isAICoachOpen && (
         <div className="xl:col-span-3 flex flex-col h-full bg-white rounded-[4rem] border border-slate-200 overflow-hidden shadow-2xl animate-in fade-in slide-in-from-right duration-700 shrink-0">
-           <AITutor initialPrompt={`Analyzing WellTegra Laboratory Link: BHP ${fmt.press(currentBHP)} ${fmt.pUnit()}, Method: ${simState.mode}. Environment: ${fmt.temp(data.ambientTemp)}${fmt.tUnit()}. Awaiting technical instruction.`} />
+           <AITutor initialPrompt={`Analyzing WellTegra Laboratory Link: BHP ${fmt.press(currentBHP)} ${fmt.pUnit()}, Method: ${simState.mode}. Environment: ${fmt.temp(data.ambientTemperature)}${fmt.tUnit()}. Awaiting technical instruction.`} />
         </div>
       )}
 

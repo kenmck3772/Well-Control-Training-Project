@@ -55,8 +55,8 @@ export interface KillSheetData {
   annulusCapacity: number;
   surfaceTemp: number;
   bottomHoleTemp: number;
-  ambientTemp: number;
-  atmPressure: number;
+  ambientTemperature: number; // New field
+  surfacePressureBaseline: number; // Renamed from atmPressure
   expectedDuration: number;
   fluidType: 'WBM' | 'OBM';
   rigPowerSource: 'Diesel' | 'Hybrid' | 'Grid';
@@ -77,8 +77,8 @@ export interface CalculationResults {
   killMudWeight: number;
   icp: number;
   fcp: number;
-  drillStringVolume: number;
-  annulusVolume: number;
+  drillStringVolume: number; // Added this
+  annulusVolume: number;     // Added this
   strokesToBit: number;
   maasp: number;
   pressureSchedule: { strokes: number; pressure: number }[];
